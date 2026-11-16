@@ -40,18 +40,26 @@ router.post("/login", async (req, res) => {
     const user = await User.findOne({ username });
 
     if (!user) {
-      return res.status(404).json({ message: "User not found." });
+      return res.status(404).json({
+        message: "User not found.",
+      });
     }
 
     const isPasswordMatch = await user.comparePassword(password);
 
     if (!isPasswordMatch) {
-      return res.status(400).json({ message: "Invalid Credentials" });
+      return res.status(400).json({
+        message: "Invalid Credentials",
+      });
     }
+
+    // Generate JWT token
+    const token = jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: "24h" });
 
     res.status(200).json({
       success: true,
       message: "Login Successful",
+      token,
       user: {
         _id: user._id,
         username: user.username,

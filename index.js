@@ -6,6 +6,7 @@ const mongoose = require("mongoose");
 const cors = require("cors");
 const http = require("http");
 const dotenv = require("dotenv");
+const jwt = require("jsonwebtoken");
 const { Server } = require("socket.io");
 
 const authRoutes = require("./routes/auth");
@@ -32,20 +33,16 @@ const allowedOrigins = [
 
 const corsOptions = {
   origin: (origin, callback) => {
-    // Allow requests without an Origin header
     if (!origin || allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
 
     console.log("Blocked by CORS:", origin);
-
     return callback(new Error("Not allowed by CORS"));
   },
 
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-
   allowedHeaders: ["Content-Type", "Authorization"],
-
   credentials: true,
 };
 
@@ -62,11 +59,37 @@ const io = new Server(server, {
 });
 
 // =================================
+// SOCKET.IO JWT AUTHENTICATION
+// =================================
+
+io.use((socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token;
+
+    if (!token) {
+      return next(new Error("Authentication token required"));
+    }
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    if (!decoded.id || !mongoose.isValidObjectId(decoded.id)) {
+      return next(new Error("Invalid authentication token"));
+    }
+
+    socket.data.userId = String(decoded.id);
+
+    next();
+  } catch (error) {
+    console.error("Socket authentication failed:", error.message);
+    next(new Error("Invalid or expired token"));
+  }
+});
+
+// =================================
 // MIDDLEWARE
 // =================================
 
 app.use(cors(corsOptions));
-
 app.use(express.json());
 
 // =================================
@@ -97,18 +120,86 @@ const getRoomId = (sender, receiver) => {
 // =================================
 
 io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
+  const currentUserId = socket.data.userId;
+
+  console.log("User connected:", currentUserId);
+
+  // =================================
+  // JOIN PERSONAL USER ROOM
+  // =================================
+
+  const personalRoom = `user_${currentUserId}`;
+
+  socket.join(personalRoom);
+
+  console.log("Joined personal room:", personalRoom);
+
+  // =================================
+  // SEND UNREAD COUNTS
+  // =================================
+
+  const sendUnreadCounts = async (userId) => {
+    try {
+      const unreadCounts = await Messages.aggregate([
+        {
+          $match: {
+            receiver: new mongoose.Types.ObjectId(userId),
+            status: { $ne: "read" },
+          },
+        },
+        {
+          $group: {
+            _id: "$sender",
+            count: { $sum: 1 },
+          },
+        },
+      ]);
+
+      const counts = {};
+
+      unreadCounts.forEach((item) => {
+        counts[item._id.toString()] = item.count;
+      });
+
+      io.to(`user_${userId}`).emit("unread_counts", counts);
+
+      return counts;
+    } catch (error) {
+      console.error("Unread count error:", error);
+      return {};
+    }
+  };
+
+  // =================================
+  // GET UNREAD MESSAGE COUNTS
+  // =================================
+
+  socket.on("get_unread_counts", async () => {
+    await sendUnreadCounts(currentUserId);
+  });
 
   // =================================
   // JOIN CHAT ROOM
   // =================================
 
   socket.on("joinRoom", (roomId) => {
-    if (!roomId) return;
+    if (typeof roomId !== "string") return;
+
+    const participants = roomId.split("_");
+
+    if (
+      participants.length !== 2 ||
+      !participants.every((id) => mongoose.isValidObjectId(id)) ||
+      !participants.includes(String(currentUserId))
+    ) {
+      return;
+    }
 
     socket.join(roomId);
 
-    console.log(`${socket.id} joined room: ${roomId}`);
+    socket.data.activeRoom = roomId;
+
+    console.log(`${currentUserId} joined room: ${roomId}`);
   });
 
   // =================================
@@ -117,6 +208,10 @@ io.on("connection", (socket) => {
 
   socket.on("typing", ({ roomId, username } = {}) => {
     if (!roomId || !username) return;
+
+    const participants = roomId.split("_");
+
+    if (!participants.includes(String(currentUserId))) return;
 
     socket.to(roomId).emit("userTyping", {
       username,
@@ -132,6 +227,10 @@ io.on("connection", (socket) => {
   socket.on("stopTyping", ({ roomId } = {}) => {
     if (!roomId) return;
 
+    const participants = roomId.split("_");
+
+    if (!participants.includes(String(currentUserId))) return;
+
     socket.to(roomId).emit("userStoppedTyping");
   });
 
@@ -141,22 +240,23 @@ io.on("connection", (socket) => {
 
   socket.on("send_message", async (data, callback) => {
     try {
-      const { sender, receiver, message } = data || {};
+      const { receiver, message } = data || {};
+
+      // Sender comes from verified JWT
+      const sender = currentUserId;
 
       if (
-        !mongoose.isValidObjectId(sender) ||
         !mongoose.isValidObjectId(receiver) ||
-        !message ||
+        String(sender) === String(receiver) ||
         typeof message !== "string" ||
         !message.trim()
       ) {
         return callback?.({
           success: false,
-          message: "Invalid sender, receiver, or message",
+          message: "Invalid receiver or message",
         });
       }
 
-      // Check users
       const [senderUser, receiverUser] = await Promise.all([
         User.findById(sender),
         User.findById(receiver),
@@ -169,7 +269,7 @@ io.on("connection", (socket) => {
         });
       }
 
-      // Save message in MongoDB
+      // SAVE MESSAGE
       const savedMessage = await Messages.create({
         sender: senderUser._id,
         receiver: receiverUser._id,
@@ -177,13 +277,15 @@ io.on("connection", (socket) => {
         status: "sent",
       });
 
-      // Generate same room ID for both users
       const roomId = getRoomId(senderUser._id, receiverUser._id);
 
-      // Send message to BOTH users
+      // SEND MESSAGE TO CHAT ROOM
       io.to(roomId).emit("receive_message", savedMessage);
 
       io.to(roomId).emit("userStoppedTyping");
+
+      // UPDATE RECEIVER'S UNREAD COUNT
+      await sendUnreadCounts(receiverUser._id);
 
       console.log("Message successfully saved:", savedMessage._id);
       console.log("Message sent to room:", roomId);
@@ -213,6 +315,7 @@ io.on("connection", (socket) => {
       const updatedMessage = await Messages.findOneAndUpdate(
         {
           _id: messageId,
+          receiver: currentUserId,
           status: "sent",
         },
         {
@@ -251,6 +354,7 @@ io.on("connection", (socket) => {
       const updatedMessage = await Messages.findOneAndUpdate(
         {
           _id: messageId,
+          receiver: currentUserId,
           status: { $in: ["sent", "delivered"] },
         },
         {
@@ -267,12 +371,16 @@ io.on("connection", (socket) => {
 
       const roomId = getRoomId(updatedMessage.sender, updatedMessage.receiver);
 
+      // UPDATE SENDER'S MESSAGE TICKS
       io.to(roomId).emit("message_status_update", {
         _id: updatedMessage._id.toString(),
         status: "read",
         deliveredAt: updatedMessage.deliveredAt,
         readAt: updatedMessage.readAt,
       });
+
+      // UPDATE RECEIVER'S UNREAD COUNTS
+      await sendUnreadCounts(currentUserId);
 
       console.log("Message read:", messageId);
     } catch (error) {
@@ -285,7 +393,7 @@ io.on("connection", (socket) => {
   // =================================
 
   socket.on("disconnect", () => {
-    console.log("User disconnected:", socket.id);
+    console.log("User disconnected:", currentUserId);
 
     if (socket.data.activeRoom) {
       socket.to(socket.data.activeRoom).emit("userStoppedTyping");
@@ -301,20 +409,15 @@ app.get("/messages", async (req, res) => {
   try {
     const { sender, receiver } = req.query;
 
-    if (!sender || !receiver) {
-      return res.status(400).json({
-        success: false,
-        message: "Sender and receiver are required",
-      });
-    }
-
     if (
+      !sender ||
+      !receiver ||
       !mongoose.isValidObjectId(sender) ||
       !mongoose.isValidObjectId(receiver)
     ) {
       return res.status(400).json({
         success: false,
-        message: "Invalid sender or receiver ID",
+        message: "Valid sender and receiver IDs are required",
       });
     }
 
@@ -348,31 +451,16 @@ app.get("/users", async (req, res) => {
   try {
     const { currentUserId } = req.query;
 
-    if (!currentUserId) {
+    if (!currentUserId || !mongoose.isValidObjectId(currentUserId)) {
       return res.status(400).json({
         success: false,
-        message: "Current user ID is required",
+        message: "Valid current user ID is required",
       });
     }
 
-    if (!mongoose.isValidObjectId(currentUserId)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid current user ID",
-      });
-    }
-
-    // Get all users except the logged-in user
     const users = await User.find({
       _id: { $ne: currentUserId },
     }).select("-password");
-
-    console.log("Current user ID:", currentUserId);
-    console.log("Users fetched:", users.length);
-    console.log(
-      "Available users:",
-      users.map((u) => u.username)
-    );
 
     return res.status(200).json({
       success: true,
@@ -385,6 +473,50 @@ app.get("/users", async (req, res) => {
       success: false,
       message: "Error fetching users",
       error: error.message,
+    });
+  }
+});
+
+// =================================
+// GET UNREAD MESSAGE COUNTS
+// =================================
+
+app.get("/unread-counts", async (req, res) => {
+  try {
+    const { userId } = req.query;
+
+    if (!userId || !mongoose.isValidObjectId(userId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid user ID is required",
+      });
+    }
+
+    const unreadCounts = await Messages.aggregate([
+      {
+        $match: {
+          receiver: new mongoose.Types.ObjectId(userId),
+          status: { $ne: "read" },
+        },
+      },
+      {
+        $group: {
+          _id: "$sender",
+          count: { $sum: 1 },
+        },
+      },
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      unreadCounts,
+    });
+  } catch (error) {
+    console.error("Unread counts error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch unread counts",
     });
   }
 });
