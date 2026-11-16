@@ -34,31 +34,50 @@ router.post("/register", async (req, res) => {
 });
 
 router.post("/login", async (req, res) => {
-  const { username, password } = req.body;
-
   try {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "Username and password are required.",
+      });
+    }
+
+    if (!process.env.JWT_SECRET) {
+      console.error("JWT_SECRET is missing from environment variables.");
+
+      return res.status(500).json({
+        success: false,
+        message: "Server configuration error.",
+      });
+    }
+
     const user = await User.findOne({ username });
 
     if (!user) {
       return res.status(404).json({
+        success: false,
         message: "User not found.",
       });
     }
 
-    const isPasswordMatch = await user.comparePassword(password);
+    const isPasswordMatch = await bcrypt.compare(password, user.password);
 
     if (!isPasswordMatch) {
       return res.status(400).json({
-        message: "Invalid Credentials",
+        success: false,
+        message: "Invalid credentials.",
       });
     }
 
-    // Generate JWT token
-    const token = jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: "24h" });
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
+      expiresIn: "24h",
+    });
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
-      message: "Login Successful",
+      message: "Login successful.",
       token,
       user: {
         _id: user._id,
@@ -66,7 +85,10 @@ router.post("/login", async (req, res) => {
       },
     });
   } catch (error) {
-    res.status(500).json({
+    console.error("LOGIN ERROR:", error);
+
+    return res.status(500).json({
+      success: false,
       message: "Server error while login.",
       error: error.message,
     });
