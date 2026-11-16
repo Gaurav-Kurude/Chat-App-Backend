@@ -18,12 +18,44 @@ const app = express();
 const server = http.createServer(app);
 
 // =================================
+// ALLOWED FRONTEND ORIGINS
+// =================================
+
+const allowedOrigins = [
+  "http://localhost:3000",
+  "https://chat-app-chi-ten-nz77cs709r.vercel.app",
+];
+
+// =================================
+// CORS CONFIGURATION
+// =================================
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Allow requests without an Origin header
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    console.log("Blocked by CORS:", origin);
+
+    return callback(new Error("Not allowed by CORS"));
+  },
+
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+
+  allowedHeaders: ["Content-Type", "Authorization"],
+
+  credentials: true,
+};
+
+// =================================
 // SOCKET.IO CONFIGURATION
 // =================================
 
 const io = new Server(server, {
   cors: {
-    origin: "http://localhost:3000",
+    origin: allowedOrigins,
     methods: ["GET", "POST"],
     credentials: true,
   },
@@ -33,12 +65,7 @@ const io = new Server(server, {
 // MIDDLEWARE
 // =================================
 
-app.use(
-  cors({
-    origin: "http://localhost:3000",
-    credentials: true,
-  }),
-);
+app.use(cors(corsOptions));
 
 app.use(express.json());
 
