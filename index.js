@@ -346,20 +346,38 @@ app.get("/messages", async (req, res) => {
 
 app.get("/users", async (req, res) => {
   try {
-    const { currentUser } = req.query;
+    const { currentUserId } = req.query;
 
-    if (!currentUser) {
+    if (!currentUserId) {
       return res.status(400).json({
         success: false,
-        message: "Current username is required",
+        message: "Current user ID is required",
       });
     }
 
+    if (!mongoose.isValidObjectId(currentUserId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid current user ID",
+      });
+    }
+
+    // Get all users except the logged-in user
     const users = await User.find({
-      username: { $ne: currentUser },
+      _id: { $ne: currentUserId },
     }).select("-password");
 
-    return res.status(200).json(users);
+    console.log("Current user ID:", currentUserId);
+    console.log("Users fetched:", users.length);
+    console.log(
+      "Available users:",
+      users.map((u) => u.username)
+    );
+
+    return res.status(200).json({
+      success: true,
+      users,
+    });
   } catch (error) {
     console.error("Fetch users error:", error);
 
