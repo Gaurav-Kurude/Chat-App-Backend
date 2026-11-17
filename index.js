@@ -144,11 +144,8 @@ const requireAuth = (req, res, next) => {
 app.use("/auth", authRoutes);
 
 // =================================
-// PRESENCE - ONLINE / OFFLINE STATUS
+// PRESENCE CONFIGURATION
 // =================================
-
-// A user is considered online if their heartbeat
-// was received within the last 60 seconds.
 
 const ONLINE_WINDOW_MS = 60 * 1000;
 
@@ -345,6 +342,7 @@ io.use((socket, next) => {
   const token = socket.handshake.auth?.token;
 
   if (!token) {
+    console.log("Socket authentication failed: Missing token");
     return next(new Error("Authentication token required"));
   }
 
@@ -355,6 +353,7 @@ io.use((socket, next) => {
 
     next();
   } catch (error) {
+    console.error("Socket authentication error:", error.message);
     next(new Error("Invalid token"));
   }
 });
@@ -364,24 +363,41 @@ io.use((socket, next) => {
 // =================================
 
 io.on("connection", (socket) => {
-  const currentUserId = socket.data.userId;
+  const currentUserId = String(socket.data.userId);
 
-  console.log("User connected:", currentUserId);
+  console.log("====================================");
+  console.log("SOCKET CONNECTED");
+  console.log("User ID:", currentUserId);
+  console.log("Socket ID:", socket.id);
+  console.log("====================================");
 
+  // =================================
   // JOIN PERSONAL USER ROOM
+  // =================================
+
   const personalRoom = `user_${currentUserId}`;
 
   socket.join(personalRoom);
 
-  console.log("Joined personal room:", personalRoom);
+  console.log("========== PERSONAL ROOM JOINED ==========");
+  console.log("User ID:", currentUserId);
+  console.log("Personal Room:", personalRoom);
+  console.log("Socket ID:", socket.id);
+  console.log("Socket Rooms:", [...socket.rooms]);
+  console.log("===========================================");
 
+  // =================================
   // SEND UNREAD COUNTS
+  // =================================
+
   const sendUnreadCounts = async (userId) => {
     try {
+      const normalizedUserId = String(userId);
+
       const unreadCounts = await Messages.aggregate([
         {
           $match: {
-            receiver: new mongoose.Types.ObjectId(userId),
+            receiver: new mongoose.Types.ObjectId(normalizedUserId),
             status: { $ne: "read" },
           },
         },
@@ -399,7 +415,7 @@ io.on("connection", (socket) => {
         counts[item._id.toString()] = item.count;
       });
 
-      io.to(`user_${userId}`).emit("unread_counts", counts);
+      io.to(`user_${normalizedUserId}`).emit("unread_counts", counts);
 
       return counts;
     } catch (error) {
@@ -408,67 +424,97 @@ io.on("connection", (socket) => {
     }
   };
 
+  // =================================
   // GET UNREAD MESSAGE COUNTS
+  // =================================
+
   socket.on("get_unread_counts", async () => {
     await sendUnreadCounts(currentUserId);
   });
 
+  // =================================
   // JOIN CHAT ROOM
+  // =================================
+
   socket.on("joinRoom", (roomId) => {
-    if (typeof roomId !== "string") return;
+    if (typeof roomId !== "string") {
+      console.log("Invalid room ID received:", roomId);
+      return;
+    }
 
     const participants = roomId.split("_");
 
     if (
       participants.length !== 2 ||
       !participants.every((id) => mongoose.isValidObjectId(id)) ||
-      !participants.includes(String(currentUserId))
+      !participants.includes(currentUserId)
     ) {
+      console.log("Room join rejected:", {
+        userId: currentUserId,
+        roomId,
+      });
       return;
     }
 
     socket.join(roomId);
     socket.data.activeRoom = roomId;
 
-    console.log(`${currentUserId} joined room: ${roomId}`);
+    console.log("========== ROOM JOINED SUCCESSFULLY ==========");
+    console.log("User ID:", currentUserId);
+    console.log("Room ID:", roomId);
+    console.log("Socket ID:", socket.id);
+    console.log("Socket Rooms:", [...socket.rooms]);
+    console.log("===============================================");
   });
 
+  // =================================
   // USER STARTED TYPING
+  // =================================
+
   socket.on("typing", ({ roomId, username } = {}) => {
     if (!roomId || !username) return;
 
     const participants = roomId.split("_");
 
-    if (!participants.includes(String(currentUserId))) return;
+    if (!participants.includes(currentUserId)) return;
 
     socket.to(roomId).emit("userTyping", {
       username,
     });
 
-    console.log(`${username} is typing`);
+    console.log(`${username} is typing in room ${roomId}`);
   });
 
+  // =================================
   // USER STOPPED TYPING
+  // =================================
+
   socket.on("stopTyping", ({ roomId } = {}) => {
     if (!roomId) return;
 
     const participants = roomId.split("_");
 
-    if (!participants.includes(String(currentUserId))) return;
+    if (!participants.includes(currentUserId)) return;
 
     socket.to(roomId).emit("userStoppedTyping");
   });
 
+  // =================================
   // SEND MESSAGE
+  // =================================
+
   socket.on("send_message", async (data, callback) => {
     try {
+      // Ensure database connection
+      await connectDB();
+
       const { receiver, message } = data || {};
 
       const sender = currentUserId;
 
       if (
         !mongoose.isValidObjectId(receiver) ||
-        String(sender) === String(receiver) ||
+        sender === String(receiver) ||
         typeof message !== "string" ||
         !message.trim()
       ) {
@@ -506,16 +552,41 @@ io.on("connection", (socket) => {
         status: "sent",
       });
 
-      const roomId = getRoomId(senderUser._id, receiverUser._id);
+      const senderId = String(senderUser._id);
+      const receiverId = String(receiverUser._id);
 
-      // Deliver message directly to receiver's personal room
-      io.to(`user_${receiverUser._id}`).emit("receive_message", savedMessage);
+      const roomId = getRoomId(senderId, receiverId);
+      const receiverPersonalRoom = `user_${receiverId}`;
+
+      // =================================
+      // CHECK RECEIVER SOCKET CONNECTION
+      // =================================
+
+      const receiverSockets = await io.in(receiverPersonalRoom).fetchSockets();
+
+      console.log("========== SENDING MESSAGE ==========");
+      console.log("Sender:", senderId);
+      console.log("Receiver:", receiverId);
+      console.log("Conversation Room:", roomId);
+      console.log("Receiver Personal Room:", receiverPersonalRoom);
+      console.log("Receiver Connected Sockets:", receiverSockets.length);
+      console.log("Saved Message ID:", String(savedMessage._id));
+      console.log("=====================================");
+
+      // =================================
+      // DELIVER TO RECEIVER PERSONAL ROOM
+      // =================================
+
+      io.to(receiverPersonalRoom).emit("receive_message", savedMessage);
+
+      // Stop typing in conversation room
       io.to(roomId).emit("userStoppedTyping");
 
-      await sendUnreadCounts(receiverUser._id);
+      // Update receiver unread count
+      await sendUnreadCounts(receiverId);
 
       console.log("Message successfully saved:", savedMessage._id);
-      console.log("Message sent to room:", roomId);
+      console.log("Message emitted to:", receiverPersonalRoom);
 
       callback?.({
         success: true,
@@ -531,10 +602,18 @@ io.on("connection", (socket) => {
     }
   });
 
+  // =================================
   // MESSAGE DELIVERED
+  // =================================
+
   socket.on("message_delivered", async ({ messageId } = {}) => {
     try {
-      if (!mongoose.isValidObjectId(messageId)) return;
+      await connectDB();
+
+      if (!mongoose.isValidObjectId(messageId)) {
+        console.log("Invalid delivered message ID:", messageId);
+        return;
+      }
 
       const updatedMessage = await Messages.findOneAndUpdate(
         {
@@ -551,26 +630,41 @@ io.on("connection", (socket) => {
         { new: true },
       );
 
-      if (!updatedMessage) return;
+      if (!updatedMessage) {
+        console.log("Delivery update skipped:", messageId);
+        return;
+      }
 
-      const roomId = getRoomId(updatedMessage.sender, updatedMessage.receiver);
+      const senderPersonalRoom = `user_${String(updatedMessage.sender)}`;
 
-      io.to(`user_${updatedMessage.sender}`).emit("message_status_update", {
-        _id: updatedMessage._id.toString(),
+      io.to(senderPersonalRoom).emit("message_status_update", {
+        _id: String(updatedMessage._id),
         status: "delivered",
         deliveredAt: updatedMessage.deliveredAt,
       });
 
-      console.log("Message delivered:", messageId);
+      console.log("========== MESSAGE DELIVERED ==========");
+      console.log("Message ID:", String(updatedMessage._id));
+      console.log("Receiver:", currentUserId);
+      console.log("Sender Room:", senderPersonalRoom);
+      console.log("=======================================");
     } catch (error) {
       console.error("Delivery receipt error:", error);
     }
   });
 
+  // =================================
   // MESSAGE READ
+  // =================================
+
   socket.on("message_read", async ({ messageId } = {}) => {
     try {
-      if (!mongoose.isValidObjectId(messageId)) return;
+      await connectDB();
+
+      if (!mongoose.isValidObjectId(messageId)) {
+        console.log("Invalid read message ID:", messageId);
+        return;
+      }
 
       const updatedMessage = await Messages.findOneAndUpdate(
         {
@@ -588,12 +682,15 @@ io.on("connection", (socket) => {
         { new: true },
       );
 
-      if (!updatedMessage) return;
+      if (!updatedMessage) {
+        console.log("Read update skipped:", messageId);
+        return;
+      }
 
-      const roomId = getRoomId(updatedMessage.sender, updatedMessage.receiver);
+      const senderPersonalRoom = `user_${String(updatedMessage.sender)}`;
 
-      io.to(`user_${updatedMessage.sender}`).emit("message_status_update", {
-        _id: updatedMessage._id.toString(),
+      io.to(senderPersonalRoom).emit("message_status_update", {
+        _id: String(updatedMessage._id),
         status: "read",
         deliveredAt: updatedMessage.deliveredAt,
         readAt: updatedMessage.readAt,
@@ -601,19 +698,31 @@ io.on("connection", (socket) => {
 
       await sendUnreadCounts(currentUserId);
 
-      console.log("Message read:", messageId);
+      console.log("========== MESSAGE READ ==========");
+      console.log("Message ID:", String(updatedMessage._id));
+      console.log("Reader:", currentUserId);
+      console.log("Sender Room:", senderPersonalRoom);
+      console.log("==================================");
     } catch (error) {
       console.error("Read receipt error:", error);
     }
   });
 
+  // =================================
   // DISCONNECT
-  socket.on("disconnect", () => {
-    console.log("User disconnected:", currentUserId);
+  // =================================
+
+  socket.on("disconnect", (reason) => {
+    console.log("========== SOCKET DISCONNECTED ==========");
+    console.log("User ID:", currentUserId);
+    console.log("Socket ID:", socket.id);
+    console.log("Reason:", reason);
 
     if (socket.data.activeRoom) {
       socket.to(socket.data.activeRoom).emit("userStoppedTyping");
     }
+
+    console.log("==========================================");
   });
 });
 
