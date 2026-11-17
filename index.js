@@ -1,7 +1,6 @@
 const dns = require("dns");
 
-// Local DNS blocks MongoDB SRV lookups. Vercel already resolves them,
-// and overriding DNS there prevents the database from connecting.
+// Local DNS configuration
 if (!process.env.VERCEL) {
   dns.setServers(["8.8.8.8", "8.8.4.4"]);
 }
@@ -14,11 +13,11 @@ const dotenv = require("dotenv");
 const jwt = require("jsonwebtoken");
 const { Server } = require("socket.io");
 
+dotenv.config();
+
 const authRoutes = require("./routes/auth");
 const Messages = require("./models/Messages.models");
 const User = require("./models/User.models");
-
-dotenv.config();
 
 const app = express();
 const server = http.createServer(app);
@@ -45,11 +44,13 @@ const corsOptions = {
     console.log("Blocked by CORS:", origin);
     return callback(new Error("Not allowed by CORS"));
   },
-
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
 };
+
+app.use(cors(corsOptions));
+app.use(express.json());
 
 // =================================
 // SOCKET.IO CONFIGURATION
@@ -64,33 +65,6 @@ const io = new Server(server, {
 });
 
 // =================================
-// SOCKET.IO JWT AUTHENTICATION
-// =================================
-
-io.use((socket, next) => {
-  const token = socket.handshake.auth?.token;
-
-  if (!token) {
-    return next(new Error("Authentication token required"));
-  }
-
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    socket.data.userId = String(decoded.id);
-    next();
-  } catch (err) {
-    next(new Error("Invalid token"));
-  }
-});
-
-// =================================
-// MIDDLEWARE
-// =================================
-
-app.use(cors(corsOptions));
-app.use(express.json());
-
-// =================================
 // DATABASE CONNECTION
 // =================================
 
@@ -103,7 +77,9 @@ const connectDB = () => {
 
   if (!connectionPromise) {
     connectionPromise = mongoose
-      .connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 8000 })
+      .connect(process.env.MONGO_URI, {
+        serverSelectionTimeoutMS: 8000,
+      })
       .then((connection) => {
         console.log("MongoDB Connected.");
         return connection;
@@ -118,6 +94,7 @@ const connectDB = () => {
   return connectionPromise;
 };
 
+// Connect to MongoDB before handling API requests
 app.use(async (req, res, next) => {
   try {
     await connectDB();
@@ -131,303 +108,105 @@ app.use(async (req, res, next) => {
 });
 
 // =================================
+// AUTHENTICATION MIDDLEWARE
+// =================================
+
+const requireAuth = (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication token required",
+      });
+    }
+
+    const token = authHeader.split(" ")[1];
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    req.userId = String(decoded.id);
+
+    next();
+  } catch (error) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized or invalid token",
+    });
+  }
+};
+
+// =================================
 // AUTH ROUTES
 // =================================
 
 app.use("/auth", authRoutes);
 
 // =================================
-// HELPER FUNCTION
+// PRESENCE - ONLINE / OFFLINE STATUS
 // =================================
 
-const getRoomId = (sender, receiver) => {
-  return [String(sender), String(receiver)].sort().join("_");
-};
+// A user is considered online if their heartbeat
+// was received within the last 60 seconds.
+
+const ONLINE_WINDOW_MS = 60 * 1000;
 
 // =================================
-// SOCKET.IO LOGIC
+// UPDATE USER LAST SEEN
 // =================================
 
-io.on("connection", (socket) => {
-  const currentUserId = socket.data.userId;
-
-  console.log("User connected:", currentUserId);
-
-  // =================================
-  // JOIN PERSONAL USER ROOM
-  // =================================
-
-  const personalRoom = `user_${currentUserId}`;
-
-  socket.join(personalRoom);
-
-  console.log("Joined personal room:", personalRoom);
-
-  // =================================
-  // SEND UNREAD COUNTS
-  // =================================
-
-  const sendUnreadCounts = async (userId) => {
-    try {
-      const unreadCounts = await Messages.aggregate([
-        {
-          $match: {
-            receiver: new mongoose.Types.ObjectId(userId),
-            status: { $ne: "read" },
-          },
+app.post("/presence/heartbeat", requireAuth, async (req, res) => {
+  try {
+    await User.updateOne(
+      { _id: req.userId },
+      {
+        $set: {
+          lastSeen: new Date(),
         },
-        {
-          $group: {
-            _id: "$sender",
-            count: { $sum: 1 },
-          },
-        },
-      ]);
+      },
+    );
 
-      const counts = {};
-
-      unreadCounts.forEach((item) => {
-        counts[item._id.toString()] = item.count;
-      });
-
-      io.to(`user_${userId}`).emit("unread_counts", counts);
-
-      return counts;
-    } catch (error) {
-      console.error("Unread count error:", error);
-      return {};
-    }
-  };
-
-  // =================================
-  // GET UNREAD MESSAGE COUNTS
-  // =================================
-
-  socket.on("get_unread_counts", async () => {
-    await sendUnreadCounts(currentUserId);
-  });
-
-  // =================================
-  // JOIN CHAT ROOM
-  // =================================
-
-  socket.on("joinRoom", (roomId) => {
-    if (typeof roomId !== "string") return;
-
-    const participants = roomId.split("_");
-
-    if (
-      participants.length !== 2 ||
-      !participants.every((id) => mongoose.isValidObjectId(id)) ||
-      !participants.includes(String(currentUserId))
-    ) {
-      return;
-    }
-
-    socket.join(roomId);
-
-    socket.data.activeRoom = roomId;
-
-    console.log(`${currentUserId} joined room: ${roomId}`);
-  });
-
-  // =================================
-  // USER STARTED TYPING
-  // =================================
-
-  socket.on("typing", ({ roomId, username } = {}) => {
-    if (!roomId || !username) return;
-
-    const participants = roomId.split("_");
-
-    if (!participants.includes(String(currentUserId))) return;
-
-    socket.to(roomId).emit("userTyping", {
-      username,
+    return res.status(200).json({
+      success: true,
+      message: "Heartbeat updated successfully",
     });
+  } catch (error) {
+    console.error("Heartbeat error:", error);
 
-    console.log(`${username} is typing`);
-  });
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update heartbeat",
+    });
+  }
+});
 
-  // =================================
-  // USER STOPPED TYPING
-  // =================================
+// =================================
+// GET ALL ONLINE USERS
+// =================================
 
-  socket.on("stopTyping", ({ roomId } = {}) => {
-    if (!roomId) return;
+app.get("/presence", requireAuth, async (req, res) => {
+  try {
+    const since = new Date(Date.now() - ONLINE_WINDOW_MS);
 
-    const participants = roomId.split("_");
+    const onlineUsers = await User.find({
+      lastSeen: {
+        $gte: since,
+      },
+    }).select("_id");
 
-    if (!participants.includes(String(currentUserId))) return;
+    return res.status(200).json({
+      success: true,
+      onlineUserIds: onlineUsers.map((user) => String(user._id)),
+    });
+  } catch (error) {
+    console.error("Get presence error:", error);
 
-    socket.to(roomId).emit("userStoppedTyping");
-  });
-
-  // =================================
-  // SEND MESSAGE
-  // =================================
-
-  socket.on("send_message", async (data, callback) => {
-    try {
-      const { receiver, message } = data || {};
-
-      // Sender comes from verified JWT
-      const sender = currentUserId;
-
-      if (
-        !mongoose.isValidObjectId(receiver) ||
-        String(sender) === String(receiver) ||
-        typeof message !== "string" ||
-        !message.trim()
-      ) {
-        return callback?.({
-          success: false,
-          message: "Invalid receiver or message",
-        });
-      }
-
-      const [senderUser, receiverUser] = await Promise.all([
-        User.findById(sender),
-        User.findById(receiver),
-      ]);
-
-      if (!senderUser || !receiverUser) {
-        return callback?.({
-          success: false,
-          message: "User not found",
-        });
-      }
-
-      // SAVE MESSAGE
-      const savedMessage = await Messages.create({
-        sender: senderUser._id,
-        receiver: receiverUser._id,
-        message: message.trim(),
-        status: "sent",
-      });
-
-      const roomId = getRoomId(senderUser._id, receiverUser._id);
-
-      // SEND MESSAGE TO CHAT ROOM
-      io.to(roomId).emit("receive_message", savedMessage);
-
-      io.to(roomId).emit("userStoppedTyping");
-
-      // UPDATE RECEIVER'S UNREAD COUNT
-      await sendUnreadCounts(receiverUser._id);
-
-      console.log("Message successfully saved:", savedMessage._id);
-      console.log("Message sent to room:", roomId);
-
-      callback?.({
-        success: true,
-        message: savedMessage,
-      });
-    } catch (error) {
-      console.error("Message sending error:", error);
-
-      callback?.({
-        success: false,
-        message: error.message,
-      });
-    }
-  });
-
-  // =================================
-  // MESSAGE DELIVERED
-  // =================================
-
-  socket.on("message_delivered", async ({ messageId } = {}) => {
-    try {
-      if (!mongoose.isValidObjectId(messageId)) return;
-
-      const updatedMessage = await Messages.findOneAndUpdate(
-        {
-          _id: messageId,
-          receiver: currentUserId,
-          status: "sent",
-        },
-        {
-          $set: {
-            status: "delivered",
-            deliveredAt: new Date(),
-          },
-        },
-        { new: true },
-      );
-
-      if (!updatedMessage) return;
-
-      const roomId = getRoomId(updatedMessage.sender, updatedMessage.receiver);
-
-      io.to(roomId).emit("message_status_update", {
-        _id: updatedMessage._id.toString(),
-        status: "delivered",
-        deliveredAt: updatedMessage.deliveredAt,
-      });
-
-      console.log("Message delivered:", messageId);
-    } catch (error) {
-      console.error("Delivery receipt error:", error);
-    }
-  });
-
-  // =================================
-  // MESSAGE READ
-  // =================================
-
-  socket.on("message_read", async ({ messageId } = {}) => {
-    try {
-      if (!mongoose.isValidObjectId(messageId)) return;
-
-      const updatedMessage = await Messages.findOneAndUpdate(
-        {
-          _id: messageId,
-          receiver: currentUserId,
-          status: { $in: ["sent", "delivered"] },
-        },
-        {
-          $set: {
-            status: "read",
-            readAt: new Date(),
-            deliveredAt: new Date(),
-          },
-        },
-        { new: true },
-      );
-
-      if (!updatedMessage) return;
-
-      const roomId = getRoomId(updatedMessage.sender, updatedMessage.receiver);
-
-      // UPDATE SENDER'S MESSAGE TICKS
-      io.to(roomId).emit("message_status_update", {
-        _id: updatedMessage._id.toString(),
-        status: "read",
-        deliveredAt: updatedMessage.deliveredAt,
-        readAt: updatedMessage.readAt,
-      });
-
-      // UPDATE RECEIVER'S UNREAD COUNTS
-      await sendUnreadCounts(currentUserId);
-
-      console.log("Message read:", messageId);
-    } catch (error) {
-      console.error("Read receipt error:", error);
-    }
-  });
-
-  // =================================
-  // DISCONNECT
-  // =================================
-
-  socket.on("disconnect", () => {
-    console.log("User disconnected:", currentUserId);
-
-    if (socket.data.activeRoom) {
-      socket.to(socket.data.activeRoom).emit("userStoppedTyping");
-    }
-  });
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch presence",
+    });
+  }
 });
 
 // =================================
@@ -548,6 +327,284 @@ app.get("/unread-counts", async (req, res) => {
       message: "Failed to fetch unread counts",
     });
   }
+});
+
+// =================================
+// HELPER FUNCTION
+// =================================
+
+const getRoomId = (sender, receiver) => {
+  return [String(sender), String(receiver)].sort().join("_");
+};
+
+// =================================
+// SOCKET.IO JWT AUTHENTICATION
+// =================================
+
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+
+  if (!token) {
+    return next(new Error("Authentication token required"));
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    socket.data.userId = String(decoded.id);
+
+    next();
+  } catch (error) {
+    next(new Error("Invalid token"));
+  }
+});
+
+// =================================
+// SOCKET.IO LOGIC
+// =================================
+
+io.on("connection", (socket) => {
+  const currentUserId = socket.data.userId;
+
+  console.log("User connected:", currentUserId);
+
+  // JOIN PERSONAL USER ROOM
+  const personalRoom = `user_${currentUserId}`;
+
+  socket.join(personalRoom);
+
+  console.log("Joined personal room:", personalRoom);
+
+  // SEND UNREAD COUNTS
+  const sendUnreadCounts = async (userId) => {
+    try {
+      const unreadCounts = await Messages.aggregate([
+        {
+          $match: {
+            receiver: new mongoose.Types.ObjectId(userId),
+            status: { $ne: "read" },
+          },
+        },
+        {
+          $group: {
+            _id: "$sender",
+            count: { $sum: 1 },
+          },
+        },
+      ]);
+
+      const counts = {};
+
+      unreadCounts.forEach((item) => {
+        counts[item._id.toString()] = item.count;
+      });
+
+      io.to(`user_${userId}`).emit("unread_counts", counts);
+
+      return counts;
+    } catch (error) {
+      console.error("Unread count error:", error);
+      return {};
+    }
+  };
+
+  // GET UNREAD MESSAGE COUNTS
+  socket.on("get_unread_counts", async () => {
+    await sendUnreadCounts(currentUserId);
+  });
+
+  // JOIN CHAT ROOM
+  socket.on("joinRoom", (roomId) => {
+    if (typeof roomId !== "string") return;
+
+    const participants = roomId.split("_");
+
+    if (
+      participants.length !== 2 ||
+      !participants.every((id) => mongoose.isValidObjectId(id)) ||
+      !participants.includes(String(currentUserId))
+    ) {
+      return;
+    }
+
+    socket.join(roomId);
+    socket.data.activeRoom = roomId;
+
+    console.log(`${currentUserId} joined room: ${roomId}`);
+  });
+
+  // USER STARTED TYPING
+  socket.on("typing", ({ roomId, username } = {}) => {
+    if (!roomId || !username) return;
+
+    const participants = roomId.split("_");
+
+    if (!participants.includes(String(currentUserId))) return;
+
+    socket.to(roomId).emit("userTyping", {
+      username,
+    });
+
+    console.log(`${username} is typing`);
+  });
+
+  // USER STOPPED TYPING
+  socket.on("stopTyping", ({ roomId } = {}) => {
+    if (!roomId) return;
+
+    const participants = roomId.split("_");
+
+    if (!participants.includes(String(currentUserId))) return;
+
+    socket.to(roomId).emit("userStoppedTyping");
+  });
+
+  // SEND MESSAGE
+  socket.on("send_message", async (data, callback) => {
+    try {
+      const { receiver, message } = data || {};
+
+      const sender = currentUserId;
+
+      if (
+        !mongoose.isValidObjectId(receiver) ||
+        String(sender) === String(receiver) ||
+        typeof message !== "string" ||
+        !message.trim()
+      ) {
+        return callback?.({
+          success: false,
+          message: "Invalid receiver or message",
+        });
+      }
+
+      const [senderUser, receiverUser] = await Promise.all([
+        User.findById(sender),
+        User.findById(receiver),
+      ]);
+
+      if (!senderUser || !receiverUser) {
+        return callback?.({
+          success: false,
+          message: "User not found",
+        });
+      }
+
+      const savedMessage = await Messages.create({
+        sender: senderUser._id,
+        receiver: receiverUser._id,
+        message: message.trim(),
+        status: "sent",
+      });
+
+      const roomId = getRoomId(senderUser._id, receiverUser._id);
+
+      io.to(roomId).emit("receive_message", savedMessage);
+      io.to(roomId).emit("userStoppedTyping");
+
+      await sendUnreadCounts(receiverUser._id);
+
+      console.log("Message successfully saved:", savedMessage._id);
+      console.log("Message sent to room:", roomId);
+
+      callback?.({
+        success: true,
+        message: savedMessage,
+      });
+    } catch (error) {
+      console.error("Message sending error:", error);
+
+      callback?.({
+        success: false,
+        message: error.message,
+      });
+    }
+  });
+
+  // MESSAGE DELIVERED
+  socket.on("message_delivered", async ({ messageId } = {}) => {
+    try {
+      if (!mongoose.isValidObjectId(messageId)) return;
+
+      const updatedMessage = await Messages.findOneAndUpdate(
+        {
+          _id: messageId,
+          receiver: currentUserId,
+          status: "sent",
+        },
+        {
+          $set: {
+            status: "delivered",
+            deliveredAt: new Date(),
+          },
+        },
+        { new: true },
+      );
+
+      if (!updatedMessage) return;
+
+      const roomId = getRoomId(updatedMessage.sender, updatedMessage.receiver);
+
+      io.to(roomId).emit("message_status_update", {
+        _id: updatedMessage._id.toString(),
+        status: "delivered",
+        deliveredAt: updatedMessage.deliveredAt,
+      });
+
+      console.log("Message delivered:", messageId);
+    } catch (error) {
+      console.error("Delivery receipt error:", error);
+    }
+  });
+
+  // MESSAGE READ
+  socket.on("message_read", async ({ messageId } = {}) => {
+    try {
+      if (!mongoose.isValidObjectId(messageId)) return;
+
+      const updatedMessage = await Messages.findOneAndUpdate(
+        {
+          _id: messageId,
+          receiver: currentUserId,
+          status: { $in: ["sent", "delivered"] },
+        },
+        {
+          $set: {
+            status: "read",
+            readAt: new Date(),
+            deliveredAt: new Date(),
+          },
+        },
+        { new: true },
+      );
+
+      if (!updatedMessage) return;
+
+      const roomId = getRoomId(updatedMessage.sender, updatedMessage.receiver);
+
+      io.to(roomId).emit("message_status_update", {
+        _id: updatedMessage._id.toString(),
+        status: "read",
+        deliveredAt: updatedMessage.deliveredAt,
+        readAt: updatedMessage.readAt,
+      });
+
+      await sendUnreadCounts(currentUserId);
+
+      console.log("Message read:", messageId);
+    } catch (error) {
+      console.error("Read receipt error:", error);
+    }
+  });
+
+  // DISCONNECT
+  socket.on("disconnect", () => {
+    console.log("User disconnected:", currentUserId);
+
+    if (socket.data.activeRoom) {
+      socket.to(socket.data.activeRoom).emit("userStoppedTyping");
+    }
+  });
 });
 
 // =================================
