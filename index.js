@@ -1,5 +1,10 @@
 const dns = require("dns");
-dns.setServers(["8.8.8.8", "8.8.4.4"]);
+
+// Local DNS blocks MongoDB SRV lookups. Vercel already resolves them,
+// and overriding DNS there prevents the database from connecting.
+if (!process.env.VERCEL) {
+  dns.setServers(["8.8.8.8", "8.8.4.4"]);
+}
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -96,10 +101,41 @@ app.use(express.json());
 // DATABASE CONNECTION
 // =================================
 
-mongoose
-  .connect(process.env.MONGO_URI)
-  .then(() => console.log("MongoDB Connected."))
-  .catch((error) => console.error("MongoDB Error:", error));
+let connectionPromise;
+
+const connectDB = () => {
+  if (mongoose.connection.readyState === 1) {
+    return Promise.resolve(mongoose.connection);
+  }
+
+  if (!connectionPromise) {
+    connectionPromise = mongoose
+      .connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 8000 })
+      .then((connection) => {
+        console.log("MongoDB Connected.");
+        return connection;
+      })
+      .catch((error) => {
+        connectionPromise = null;
+        console.error("MongoDB Error:", error.message);
+        throw error;
+      });
+  }
+
+  return connectionPromise;
+};
+
+app.use(async (req, res, next) => {
+  try {
+    await connectDB();
+    next();
+  } catch (error) {
+    res.status(500).json({
+      message: "Database connection failed",
+      error: error.message,
+    });
+  }
+});
 
 // =================================
 // AUTH ROUTES
