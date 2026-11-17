@@ -68,25 +68,18 @@ const io = new Server(server, {
 // =================================
 
 io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+
+  if (!token) {
+    return next(new Error("Authentication token required"));
+  }
+
   try {
-    const token = socket.handshake.auth?.token;
-
-    if (!token) {
-      return next(new Error("Authentication token required"));
-    }
-
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    if (!decoded.id || !mongoose.isValidObjectId(decoded.id)) {
-      return next(new Error("Invalid authentication token"));
-    }
-
-    socket.data.userId = String(decoded.id);
-
+    socket.userId = decoded.id;
     next();
-  } catch (error) {
-    console.error("Socket authentication failed:", error.message);
-    next(new Error("Invalid or expired token"));
+  } catch (err) {
+    next(new Error("Invalid token"));
   }
 });
 
