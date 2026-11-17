@@ -483,10 +483,19 @@ io.on("connection", (socket) => {
         User.findById(receiver),
       ]);
 
+      console.log("========== MESSAGE DEBUG ==========");
+      console.log("Authenticated sender ID:", sender);
+      console.log("Requested receiver ID:", receiver);
+      console.log("Sender found:", !!senderUser);
+      console.log("Receiver found:", !!receiverUser);
+      console.log("===================================");
+
       if (!senderUser || !receiverUser) {
         return callback?.({
           success: false,
           message: "User not found",
+          senderFound: !!senderUser,
+          receiverFound: !!receiverUser,
         });
       }
 
