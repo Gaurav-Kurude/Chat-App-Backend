@@ -499,7 +499,8 @@ io.on("connection", (socket) => {
 
       const roomId = getRoomId(senderUser._id, receiverUser._id);
 
-      io.to(roomId).emit("receive_message", savedMessage);
+      // Deliver message directly to receiver's personal room
+      io.to(`user_${receiverUser._id}`).emit("receive_message", savedMessage);
       io.to(roomId).emit("userStoppedTyping");
 
       await sendUnreadCounts(receiverUser._id);
@@ -545,7 +546,7 @@ io.on("connection", (socket) => {
 
       const roomId = getRoomId(updatedMessage.sender, updatedMessage.receiver);
 
-      io.to(roomId).emit("message_status_update", {
+      io.to(`user_${updatedMessage.sender}`).emit("message_status_update", {
         _id: updatedMessage._id.toString(),
         status: "delivered",
         deliveredAt: updatedMessage.deliveredAt,
@@ -582,7 +583,7 @@ io.on("connection", (socket) => {
 
       const roomId = getRoomId(updatedMessage.sender, updatedMessage.receiver);
 
-      io.to(roomId).emit("message_status_update", {
+      io.to(`user_${updatedMessage.sender}`).emit("message_status_update", {
         _id: updatedMessage._id.toString(),
         status: "read",
         deliveredAt: updatedMessage.deliveredAt,
